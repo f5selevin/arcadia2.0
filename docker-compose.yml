@@ -1,0 +1,143 @@
+services:
+  arcadia-proxy:
+    build:
+      context: ./scripts/dev/traefik
+    container_name: arcadia-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - arcadia-frontend
+      - arcadia-users
+      - arcadia-login
+      - arcadia-stocks
+      - arcadia-stock-transaction
+    ports:
+      - "5000:5000"
+      - "8081:8080"
+
+  arcadia-db:
+    build:
+      context: ./backend/arcadia-db
+    container_name: arcadia-db
+    ports:
+      - "27017:27017"
+    # In-memory only: wiped on every container stop, so mongo-init.js reseeds each start.
+    tmpfs:
+      - /data/db
+      - /data/configdb
+    # Connect via the service name, not localhost: during seeding mongod binds
+    # 127.0.0.1 only, so this stays unhealthy until the seed is actually queryable.
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet mongodb://arcadia-db:27017/arcadia-db --eval 'quit(db.users.countDocuments() > 0 ? 0 : 1)'"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  arcadia-users:
+    build:
+      context: ./backend/users
+    container_name: arcadia-users
+    depends_on:
+      arcadia-db:
+        condition: service_healthy
+    environment:
+      WEBPORT: 80
+      DB: arcadia-db
+      USERSAPIHOST: arcadia-users
+      LOGINAPIHOST: arcadia-login
+      STOCKSAPIHOST: arcadia-stocks
+      STOCKTAPIHOST: arcadia-stock-transaction
+      CASHTAPIHOST: arcadia-cash-transfer
+    ports:
+      - "3001:80"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.users.rule: "PathPrefix(`/v1/user`)"
+      traefik.http.routers.users.entrypoints: "web"
+      traefik.http.routers.users.priority: "100"
+      traefik.http.services.users.loadbalancer.server.port: "80"
+
+  arcadia-login:
+    build:
+      context: ./backend/login
+    container_name: arcadia-login
+    depends_on:
+      - arcadia-users
+    environment:
+      WEBPORT: 80
+      USERSAPIHOST: arcadia-users
+      LOGINAPIHOST: arcadia-login
+      STOCKSAPIHOST: arcadia-stocks
+      STOCKTAPIHOST: arcadia-stock-transaction
+      CASHTAPIHOST: arcadia-cash-transfer
+    ports:
+      - "3002:80"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.login.rule: "PathPrefix(`/v1/login`)"
+      traefik.http.routers.login.entrypoints: "web"
+      traefik.http.routers.login.priority: "100"
+      traefik.http.services.login.loadbalancer.server.port: "80"
+
+  arcadia-stocks:
+    build:
+      context: ./backend/stocks
+    container_name: arcadia-stocks
+    environment:
+      WEBPORT: 80
+      USERSAPIHOST: arcadia-users
+      LOGINAPIHOST: arcadia-login
+      STOCKSAPIHOST: arcadia-stocks
+      STOCKTAPIHOST: arcadia-stock-transaction
+      CASHTAPIHOST: arcadia-cash-transfer
+    ports:
+      - "3004:80"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.stocks.rule: "PathPrefix(`/v1/stock`)"
+      traefik.http.routers.stocks.entrypoints: "web"
+      traefik.http.routers.stocks.priority: "100"
+      traefik.http.services.stocks.loadbalancer.server.port: "80"
+
+  arcadia-stock-transaction:
+    build:
+      context: ./backend/stock_transaction
+    container_name: arcadia-stock-transaction
+    depends_on:
+      arcadia-db:
+        condition: service_healthy
+      arcadia-users:
+        condition: service_started
+      arcadia-stocks:
+        condition: service_started
+    environment:
+      WEBPORT: 80
+      DB: arcadia-db
+      USERSAPIHOST: arcadia-users
+      LOGINAPIHOST: arcadia-login
+      STOCKSAPIHOST: arcadia-stocks
+      STOCKTAPIHOST: arcadia-stock-transaction
+      CASHTAPIHOST: arcadia-cash-transfer
+    ports:
+      - "3005:80"
+    labels:
+      traefik.enable: "true"
+      # Must outrank /v1/stock, which also prefix-matches /v1/stockt.
+      traefik.http.routers.stockt.rule: "PathPrefix(`/v1/stockt`)"
+      traefik.http.routers.stockt.entrypoints: "web"
+      traefik.http.routers.stockt.priority: "200"
+      traefik.http.services.stockt.loadbalancer.server.port: "80"
+
+  arcadia-frontend:
+    build:
+      context: ./frontend/main
+    container_name: arcadia-frontend
+    ports:
+      - "8080:80"
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.frontend.rule: "PathPrefix(`/`)"
+      traefik.http.routers.frontend.entrypoints: "web"
+      traefik.http.routers.frontend.priority: "1"
+      traefik.http.services.frontend.loadbalancer.server.port: "80"
