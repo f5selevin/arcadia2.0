@@ -1,5 +1,5 @@
 ---
-- name: Build and deploy the Arcadia frontend on the current VM
+- name: Deploy the prebuilt Arcadia frontend on the current VM
   hosts: localhost
   connection: local
   become: true
@@ -7,20 +7,8 @@
 
   vars:
     frontend_dir: "{{ repo_root }}/frontend/main"
+    frontend_dist_dir: "{{ frontend_dir }}/dist"
     web_root: /var/www/arcadia
-    node_version: "20.20.2"
-    node_arch_map:
-      x86_64: x64
-      aarch64: arm64
-    node_checksum_map:
-      x64: df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d
-      arm64: 73093db209e4e9e09dd7d15a47aeaab1b74833830df03efa5f942a1122c5fa71
-    node_arch: "{{ node_arch_map.get(ansible_architecture, '') }}"
-    node_checksum: "{{ node_checksum_map.get(node_arch, '') }}"
-    node_archive: "node-v{{ node_version }}-linux-{{ node_arch }}.tar.xz"
-    node_url: "https://nodejs.org/dist/v{{ node_version }}/{{ node_archive }}"
-    node_install_dir: "/opt/node-v{{ node_version }}-linux-{{ node_arch }}"
-    node_bin_dir: /usr/local/bin
 
   pre_tasks:
     - name: Verify Amazon Linux
@@ -29,122 +17,29 @@
           - ansible_distribution == "Amazon"
         fail_msg: "This playbook supports Amazon Linux only."
 
-    - name: Verify the repository frontend path
+    - name: Verify the committed frontend artifact
       ansible.builtin.stat:
-        path: "{{ frontend_dir }}/package.json"
-      register: frontend_package
+        path: "{{ frontend_dist_dir }}/index.html"
+      register: frontend_index
 
-    - name: Stop when the frontend path is invalid
+    - name: Stop when the committed frontend artifact is missing
       ansible.builtin.assert:
         that:
-          - frontend_package.stat.exists
-          - frontend_package.stat.isreg
+          - frontend_index.stat.exists
+          - frontend_index.stat.isreg
         fail_msg: >-
-          Expected {{ frontend_dir }}/package.json. Run setup-frontent/setup.sh
-          from the cloned arcadia2.0 repository.
-
-    - name: Verify the CPU architecture
-      ansible.builtin.assert:
-        that:
-          - node_arch | length > 0
-          - node_checksum | length == 64
-        fail_msg: "Unsupported CPU architecture: {{ ansible_architecture }}"
+          Expected the prebuilt artifact at {{ frontend_dist_dir }}/index.html.
+          Build frontend/main locally, commit the complete dist directory, pull
+          that commit onto this VM, and rerun setup-frontent/setup.sh.
 
   tasks:
-    - name: Install operating-system packages
+    - name: Install deployment packages
       ansible.builtin.dnf:
         name:
           - nginx
-          - tar
-          - xz
+          - rsync
         state: present
         update_cache: true
-
-    - name: Download Node.js
-      ansible.builtin.get_url:
-        url: "{{ node_url }}"
-        dest: "/var/tmp/{{ node_archive }}"
-        checksum: "sha256:{{ node_checksum }}"
-        mode: "0644"
-
-    - name: Check whether this Node.js release is installed
-      ansible.builtin.stat:
-        path: "{{ node_install_dir }}/bin/node"
-      register: installed_node
-
-    - name: Extract Node.js
-      ansible.builtin.unarchive:
-        src: "/var/tmp/{{ node_archive }}"
-        dest: /opt
-        remote_src: true
-      when: not installed_node.stat.exists
-
-    - name: Link Node.js commands globally
-      ansible.builtin.file:
-        src: "{{ node_install_dir }}/bin/{{ item }}"
-        dest: "{{ node_bin_dir }}/{{ item }}"
-        state: link
-        force: true
-      loop:
-        - node
-        - npm
-        - npx
-
-    - name: Explain dependency-install progress reporting
-      ansible.builtin.debug:
-        msg: >-
-          Installing frontend dependencies. Ansible will poll every 5 seconds;
-          this can take several minutes on a t3.micro.
-
-    - name: Install locked frontend dependencies
-      ansible.builtin.command:
-        cmd: npm ci --legacy-peer-deps --loglevel info
-        chdir: "{{ frontend_dir }}"
-      environment:
-        PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
-      async: 3600
-      poll: 5
-      register: npm_install_result
-      changed_when: true
-
-    - name: Show dependency-install output
-      ansible.builtin.debug:
-        msg: "{{ (npm_install_result.stdout_lines | default([])) + (npm_install_result.stderr_lines | default([])) }}"
-
-    - name: Explain frontend-build progress reporting
-      ansible.builtin.debug:
-        msg: >-
-          Building only frontend/main with vue-cli-service (no Docker).
-          Ansible will poll every 5 seconds and print the complete build output
-          when compilation finishes.
-
-    - name: Build only the Vue production frontend
-      ansible.builtin.command:
-        cmd: ./node_modules/.bin/vue-cli-service build
-        chdir: "{{ frontend_dir }}"
-      environment:
-        PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
-        NODE_ENV: production
-        NODE_OPTIONS: --openssl-legacy-provider
-      async: 3600
-      poll: 5
-      register: frontend_build_result
-      changed_when: true
-
-    - name: Show frontend build output
-      ansible.builtin.debug:
-        msg: "{{ (frontend_build_result.stdout_lines | default([])) + (frontend_build_result.stderr_lines | default([])) }}"
-
-    - name: Verify that the build produced index.html
-      ansible.builtin.stat:
-        path: "{{ frontend_dir }}/dist/index.html"
-      register: built_index
-
-    - name: Stop when the frontend build is missing
-      ansible.builtin.assert:
-        that:
-          - built_index.stat.exists
-        fail_msg: "The frontend build did not produce {{ frontend_dir }}/dist/index.html."
 
     - name: Create the Nginx document root
       ansible.builtin.file:
@@ -154,28 +49,18 @@
         group: nginx
         mode: "0755"
 
-    - name: Deploy the frontend build
-      ansible.builtin.copy:
-        src: "{{ frontend_dir }}/dist/"
-        dest: "{{ web_root }}/"
-        owner: nginx
-        group: nginx
-        mode: preserve
-      notify: Reload nginx
-
-    - name: Remove stale files from an earlier frontend build
-      ansible.builtin.shell:
-        cmd: |
-          set -o pipefail
-          cd {{ web_root | quote }}
-          find . -mindepth 1 -print0 | while IFS= read -r -d '' path; do
-            if [[ ! -e {{ (frontend_dir ~ '/dist') | quote }}/"$path" ]]; then
-              rm -rf -- "$path"
-            fi
-          done
-        executable: /bin/bash
-      register: stale_cleanup
-      changed_when: false
+    - name: Synchronize the committed frontend artifact
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - --archive
+          - --delete
+          - --itemize-changes
+          - --chown=nginx:nginx
+          - "{{ frontend_dist_dir }}/"
+          - "{{ web_root }}/"
+      register: frontend_sync
+      changed_when: frontend_sync.stdout | length > 0
       notify: Reload nginx
 
     - name: Install the Arcadia Nginx configuration
