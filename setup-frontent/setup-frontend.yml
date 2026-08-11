@@ -92,7 +92,7 @@
 
     - name: Install locked frontend dependencies
       ansible.builtin.command:
-        cmd: npm ci
+        cmd: npm ci --legacy-peer-deps
         chdir: "{{ frontend_dir }}"
       environment:
         PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
